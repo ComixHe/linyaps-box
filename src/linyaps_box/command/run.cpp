@@ -31,5 +31,6 @@ auto linyaps_box::command::run(const struct run_options &options, const global_o
         run_options.console_socket = unix_socket::connect(*options.console_socket);
     }
 
-    return container.run(std::move(run_options));
+    container.create(std::move(run_options));
+    return container.start();
 }

@@ -65,6 +65,8 @@ enum class sync_message : std::uint8_t {
     CREATERUNTIME_HOOKS_EXECUTED,
     CREATECONTAINER_HOOKS_EXECUTED,
     STARTCONTAINER_HOOKS_EXECUTED,
+    CONTAINER_CREATED,
+    START_CONTAINER,
     ERROR,
 };
 
@@ -99,6 +101,12 @@ std::ostream &operator<<(std::ostream &os, const sync_message message)
     } break;
     case sync_message::STARTCONTAINER_HOOKS_EXECUTED: {
         os << "START_CONTAINER_HOOKS_EXECUTED";
+    } break;
+    case sync_message::CONTAINER_CREATED: {
+        os << "CONTAINER_CREATED";
+    } break;
+    case sync_message::START_CONTAINER: {
+        os << "START_CONTAINER";
     } break;
     case sync_message::ERROR: {
         os << "ERROR";
@@ -1858,6 +1866,18 @@ try {
     linyaps_box::utils::sigprocmask(SIG_UNBLOCK, set, nullptr);
     linyaps_box::utils::reset_signals(set);
 
+    {
+        LINYAPS_BOX_DEBUG() << "Container created, waiting for start signal";
+        socket << std::byte(sync_message::CONTAINER_CREATED);
+
+        std::byte start_byte;
+        socket >> start_byte;
+        auto start_message = sync_message(start_byte);
+        if (start_message != sync_message::START_CONTAINER) {
+            throw unexpected_sync_message(sync_message::START_CONTAINER, start_message);
+        }
+    }
+
     start_container_hooks(container, status, socket);
     execute_process(oci_config);
 } catch (const std::exception &e) {
@@ -2533,53 +2553,72 @@ const std::filesystem::path &linyaps_box::container::get_bundle() const
     return this->bundle;
 }
 
-// maybe we need a internal run function?
-int linyaps_box::container::run(run_container_options_t options)
+void linyaps_box::container::create(run_container_options_t options)
+{
+    std::ignore = utils::prctl(PR_SET_CHILD_SUBREAPER, 1L, 0L, 0L, 0L);
+
+    if (config.process->terminal && !options.console_socket) {
+        auto [socket1, socket2] = linyaps_box::unix_socket::pair();
+        options.console_socket = unix_socket{ std::move(socket1) };
+        console_recv_socket_ = unix_socket{ std::move(socket2) };
+    }
+
+    // block all signals so that we can't be interrupted
+    sigset_t set;
+    utils::sigfillset(set);
+    sigdelset(&set, SIGUSR1); // for debug
+    utils::sigprocmask(SIG_BLOCK, set, nullptr);
+
+    umask(0);
+
+    // TODO: cgroup preenter
+    auto [child_pid, socket] = runtime_ns::start_container_process(*this, options);
+
+    {
+        auto status = this->status();
+        if (status.status != container_status_t::runtime_status::CREATING) {
+            throw std::runtime_error("unexpected container status before creating: "
+                                     + std::to_string(static_cast<int>(status.status)));
+        }
+        status.PID = child_pid;
+        status.status = container_status_t::runtime_status::CREATED;
+        this->status_dir().write(status);
+    }
+
+    child_pid_ = child_pid;
+    sync_socket_ = std::move(socket);
+
+    runtime_ns::configure_container_namespaces(*this, *sync_socket_);
+    runtime_ns::prestart_hooks(*this, *sync_socket_);
+    runtime_ns::create_runtime_hooks(*this, *sync_socket_);
+    runtime_ns::wait_create_container_result(*this, *sync_socket_);
+
+    // Wait for child to finish container setup (mounts, pivot_root, capabilities)
+    // and signal that it is ready, paused before start_container_hooks
+    {
+        LINYAPS_BOX_DEBUG() << "Waiting for child CONTAINER_CREATED signal";
+        std::byte byte;
+        *sync_socket_ >> byte;
+        auto message = sync_message(byte);
+        if (message != sync_message::CONTAINER_CREATED) {
+            throw unexpected_sync_message(sync_message::CONTAINER_CREATED, message);
+        }
+        LINYAPS_BOX_DEBUG() << "Container created, child is waiting for start signal";
+    }
+}
+
+int linyaps_box::container::start()
 {
     int container_process_exit_code{ -1 };
 
-    std::ignore = utils::prctl(PR_SET_CHILD_SUBREAPER, 1L, 0L, 0L, 0L);
-
     try {
-        // TODO: there are some thing that should be done before starting the container process
-        // e.g. do something before creating cgroup by selecting manager, selinux label, seccomp
-        // setup, etc.
-
-        std::optional<unix_socket> recv_socketpair;
-        if (config.process->terminal && !options.console_socket) {
-            auto [socket1, socket2] = linyaps_box::unix_socket::pair();
-            options.console_socket = unix_socket{ std::move(socket1) };
-            recv_socketpair = unix_socket{ std::move(socket2) };
-        }
-
-        // block all signals so that we can't be interrupted
-        sigset_t set;
-        utils::sigfillset(set);
-        sigdelset(&set, SIGUSR1); // for debug
-        utils::sigprocmask(SIG_BLOCK, set, nullptr);
-
-        umask(0);
-
-        // TODO: cgroup preenter
-        auto [child_pid, socket] = runtime_ns::start_container_process(*this, options);
-
+        // Signal child to proceed with start_container_hooks + exec
         {
-            auto status = this->status();
-            if (status.status != container_status_t::runtime_status::CREATING) {
-                throw std::runtime_error("unexpected container status before creating: "
-                                         + std::to_string(static_cast<int>(status.status)));
-            }
-            status.PID = child_pid;
-            status.status = container_status_t::runtime_status::CREATED;
-            this->status_dir().write(status);
+            LINYAPS_BOX_DEBUG() << "Sending START_CONTAINER signal to child";
+            *sync_socket_ << std::byte(sync_message::START_CONTAINER);
         }
 
-        runtime_ns::configure_container_namespaces(*this, socket);
-        runtime_ns::prestart_hooks(*this, socket);
-        runtime_ns::create_runtime_hooks(*this, socket);
-        runtime_ns::wait_create_container_result(*this, socket);
-
-        runtime_ns::wait_socket_close(socket);
+        runtime_ns::wait_socket_close(*sync_socket_);
 
         {
             auto status = this->status();
@@ -2587,14 +2626,14 @@ int linyaps_box::container::run(run_container_options_t options)
                 throw std::runtime_error("unexpected container status before running: "
                                          + std::to_string(static_cast<int>(status.status)));
             }
-            status.PID = child_pid;
+            status.PID = child_pid_;
             status.status = container_status_t::runtime_status::RUNNING;
             this->status_dir().write(status);
         }
 
         runtime_ns::poststart_hooks(*this);
 
-        container_monitor monitor(child_pid);
+        container_monitor monitor(child_pid_);
         monitor.enable_signal_forwarding();
 
         auto in = utils::file_descriptor{ STDIN_FILENO, false };
@@ -2620,15 +2659,15 @@ int linyaps_box::container::run(run_container_options_t options)
               }
           });
 
-        [&recv_socketpair, &monitor, &in, &out, &changed]() -> void {
-            if (!recv_socketpair) {
+        [&console_recv_socket_ = this->console_recv_socket_, &monitor, &in, &out, &changed]() -> void {
+            if (!console_recv_socket_) {
                 return;
             }
 
             LINYAPS_BOX_DEBUG() << "Container requires a terminal";
 
-            auto master = runtime_ns::recv_master_tty(recv_socketpair.value());
-            recv_socketpair->release();
+            auto master = runtime_ns::recv_master_tty(*console_recv_socket_);
+            console_recv_socket_->release();
 
             in.set_nonblock(true);
             out.set_nonblock(true);
@@ -2643,10 +2682,10 @@ int linyaps_box::container::run(run_container_options_t options)
 
         runtime_ns::poststop_hooks(*this);
     } catch (const std::system_error &e) {
-        LINYAPS_BOX_ERR() << "failed to run a container, caused by: " << e.what()
+        LINYAPS_BOX_ERR() << "failed to start a container, caused by: " << e.what()
                           << ", code: " << e.code();
     } catch (const std::exception &e) {
-        LINYAPS_BOX_ERR() << "failed to run a container, caused by: " << e.what();
+        LINYAPS_BOX_ERR() << "failed to start a container, caused by: " << e.what();
     }
 
     this->status_dir().remove();

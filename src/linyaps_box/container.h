@@ -11,6 +11,8 @@
 #include "linyaps_box/unix_socket.h"
 #include "linyaps_box/utils/file_describer.h"
 
+#include <optional>
+
 namespace linyaps_box {
 
 struct create_container_options_t
@@ -25,7 +27,10 @@ struct run_container_options_t
 {
     int preserve_fds;
     std::optional<unix_socket> console_socket;
+    std::optional<socket> notify_listener;
 };
+
+inline constexpr std::uint8_t notify_start_byte = 9;
 
 class container final : public container_ref
 {
@@ -39,9 +44,11 @@ public:
 
     [[nodiscard]] auto get_config() const -> const linyaps_box::oci_config &;
     [[nodiscard]] auto get_bundle() const -> const std::filesystem::path &;
-    [[nodiscard]] auto run(run_container_options_t options) -> int;
 
-    // TODO:: support fully container capabilities, e.g. create, start, stop, delete...
+    auto create(run_container_options_t options) -> void;
+    [[nodiscard]] auto start() -> int;
+
+    [[nodiscard]] auto child_pid() const noexcept { return child_pid_; }
 
     ~container() noexcept override = default;
 
@@ -74,6 +81,10 @@ private:
     uid_t host_uid_;
     bool deny_setgroups_{ false };
     bool mount_dev_from_host_{ false };
+
+    pid_t child_pid_{ -1 };
+    std::optional<unix_socket> sync_socket_;
+    std::optional<unix_socket> console_recv_socket_;
 };
 
 } // namespace linyaps_box
