@@ -20,13 +20,14 @@
 #include "linyaps_box/protocol/message_channel.h"
 #include "linyaps_box/protocol/sync_socket_forwarder.h"
 #include "linyaps_box/security/privilege.h"
+#include "linyaps_box/specconv/mount.h"
+#include "linyaps_box/specconv/namespace.h"
+#include "linyaps_box/specconv/process.h"
 #include "linyaps_box/terminal.h"
 #include "linyaps_box/utils/cgroups.h"
 #include "linyaps_box/utils/close_range.h"
 #include "linyaps_box/utils/enum_formatter.h" // IWYU pragma: keep
 #include "linyaps_box/utils/file_describer.h"
-#include "linyaps_box/utils/ns_flags.h"
-#include "linyaps_box/utils/rlimit.h"
 #include "linyaps_box/utils/session.h"
 #include "linyaps_box/utils/setns.h"
 #include "linyaps_box/utils/signal.h"
@@ -66,100 +67,6 @@ namespace {
 using protocol::child_message_channel;
 using protocol::parent_message_channel;
 namespace stage = protocol::stage;
-
-[[nodiscard]] constexpr auto to_os_vfs_flags(utils::bitflags<vfs_flag> flags) noexcept
-  -> unsigned long
-{
-    unsigned long out{ 0 };
-    const auto add = [&](vfs_flag f, unsigned long ms) {
-        if (flags.contains(f)) {
-            out |= ms;
-        }
-    };
-    add(vfs_flag::bind, MS_BIND);
-    add(vfs_flag::rec, MS_REC);
-    add(vfs_flag::ro, MS_RDONLY);
-    add(vfs_flag::nosuid, MS_NOSUID);
-    add(vfs_flag::nodev, MS_NODEV);
-    add(vfs_flag::noexec, MS_NOEXEC);
-    add(vfs_flag::noatime, MS_NOATIME);
-    add(vfs_flag::nodiratime, MS_NODIRATIME);
-    add(vfs_flag::relatime, MS_RELATIME);
-    add(vfs_flag::strictatime, MS_STRICTATIME);
-    add(vfs_flag::sync, MS_SYNCHRONOUS);
-    add(vfs_flag::dirsync, MS_DIRSYNC);
-    add(vfs_flag::iversion, MS_I_VERSION);
-    add(vfs_flag::lazytime, MS_LAZYTIME);
-    add(vfs_flag::mand, MS_MANDLOCK);
-    add(vfs_flag::silent, MS_SILENT);
-    add(vfs_flag::nosymfollow, linyaps_box::os::sys::ms_nosymfollow);
-    add(vfs_flag::remount, MS_REMOUNT);
-    return out;
-}
-
-[[nodiscard]] constexpr auto
-to_os_propagation_flags(utils::bitflags<propagation_flag> flags) noexcept -> unsigned long
-{
-    unsigned long out{ 0 };
-    const auto add = [&](propagation_flag f, unsigned long ms) {
-        if (flags.contains(f)) {
-            out |= ms;
-        }
-    };
-    add(propagation_flag::private_, MS_PRIVATE);
-    add(propagation_flag::slave, MS_SLAVE);
-    add(propagation_flag::shared, MS_SHARED);
-    add(propagation_flag::unbindable, MS_UNBINDABLE);
-    add(propagation_flag::rec, MS_REC);
-    return out;
-}
-
-[[nodiscard]] constexpr auto to_os_rootfs_propagation(rootfs_propagation prop) noexcept
-  -> unsigned long
-{
-    switch (prop) {
-    case rootfs_propagation::private_:
-        return MS_PRIVATE;
-    case rootfs_propagation::shared:
-        return MS_SHARED;
-    case rootfs_propagation::slave:
-        return MS_SLAVE;
-    case rootfs_propagation::unbindable:
-        return MS_UNBINDABLE;
-    }
-
-    return 0;
-}
-
-[[nodiscard]] constexpr auto from_os_vfs_flags(unsigned long ms) noexcept
-  -> utils::bitflags<vfs_flag>
-{
-    utils::bitflags<vfs_flag> out{ };
-    const auto add = [&](vfs_flag f, unsigned long bit) {
-        if ((ms & bit) != 0) {
-            out |= f;
-        }
-    };
-    add(vfs_flag::bind, MS_BIND);
-    add(vfs_flag::rec, MS_REC);
-    add(vfs_flag::ro, MS_RDONLY);
-    add(vfs_flag::nosuid, MS_NOSUID);
-    add(vfs_flag::nodev, MS_NODEV);
-    add(vfs_flag::noexec, MS_NOEXEC);
-    add(vfs_flag::noatime, MS_NOATIME);
-    add(vfs_flag::nodiratime, MS_NODIRATIME);
-    add(vfs_flag::relatime, MS_RELATIME);
-    add(vfs_flag::strictatime, MS_STRICTATIME);
-    add(vfs_flag::sync, MS_SYNCHRONOUS);
-    add(vfs_flag::dirsync, MS_DIRSYNC);
-    add(vfs_flag::iversion, MS_I_VERSION);
-    add(vfs_flag::lazytime, MS_LAZYTIME);
-    add(vfs_flag::mand, MS_MANDLOCK);
-    add(vfs_flag::silent, MS_SILENT);
-    add(vfs_flag::nosymfollow, linyaps_box::os::sys::ms_nosymfollow);
-    add(vfs_flag::remount, MS_REMOUNT);
-    return out;
-}
 
 [[maybe_unused]] auto get_pid_namespace() -> std::string
 {
@@ -611,7 +518,7 @@ auto do_propagation_mount(const utils::file_descriptor &destination, unsigned lo
 
     // remove MS_RDONLY for creating destination
     // we will remount it on later
-    const auto bind_flags = to_os_vfs_flags(mount.vfs_flags) & ~MS_RDONLY;
+    const auto bind_flags = specconv::to_vfs_flags(mount.vfs_flags) & ~MS_RDONLY;
     try {
         // bind mount will ignore fstype and data
         syscall_mount(source_ref.proc_path().c_str(),
@@ -662,13 +569,13 @@ auto do_propagation_mount(const utils::file_descriptor &destination, unsigned lo
         return std::nullopt;
     }
 
-    if ((to_os_vfs_flags(mount.vfs_flags) & MS_BIND) != 0 && mount.destination == "/sys"
-        && (to_os_vfs_flags(mount.vfs_flags) & MS_REC) != 0) {
+    if ((specconv::to_vfs_flags(mount.vfs_flags) & MS_BIND) != 0 && mount.destination == "/sys"
+        && (specconv::to_vfs_flags(mount.vfs_flags) & MS_REC) != 0) {
         is_sys_rbind = true;
     }
 
     utils::file_descriptor destination_fd;
-    if ((to_os_vfs_flags(mount.vfs_flags) & MS_BIND) != 0) {
+    if ((specconv::to_vfs_flags(mount.vfs_flags) & MS_BIND) != 0) {
         destination_fd = do_bind_mount(root, mount);
 
         if (mount.destination == "/dev") {
@@ -682,7 +589,7 @@ auto do_propagation_mount(const utils::file_descriptor &destination, unsigned lo
             syscall_mount(mount.source ? mount.source.value().c_str() : nullptr,
                           dest_proc_path.c_str(),
                           mount.type ? mount.type.value().c_str() : nullptr,
-                          to_os_vfs_flags(mount.vfs_flags),
+                          specconv::to_vfs_flags(mount.vfs_flags),
                           mount.data.empty() ? nullptr : mount.data.c_str());
         } catch (const std::system_error &e) {
             // TODO: refactor below codes
@@ -731,14 +638,15 @@ auto do_propagation_mount(const utils::file_descriptor &destination, unsigned lo
         }
     }
 
-    if (const auto prop_flags = to_os_propagation_flags(mount.propagation_flags); prop_flags != 0) {
+    if (const auto prop_flags = specconv::to_propagation_flags(mount.propagation_flags);
+        prop_flags != 0) {
         do_propagation_mount(destination_fd, prop_flags);
     }
 
     bool need_remount{ false };
     // we will do all bind/ro mount at finalize so we can
     // create missing destinations
-    if ((to_os_vfs_flags(mount.vfs_flags) & (MS_RDONLY | MS_BIND)) != 0) {
+    if ((specconv::to_vfs_flags(mount.vfs_flags) & (MS_RDONLY | MS_BIND)) != 0) {
         need_remount = true;
     }
 
@@ -765,7 +673,7 @@ auto do_propagation_mount(const utils::file_descriptor &destination, unsigned lo
         return std::nullopt;
     }
 
-    auto remount_flags = to_os_vfs_flags(mount.vfs_flags) | MS_REMOUNT;
+    auto remount_flags = specconv::to_vfs_flags(mount.vfs_flags) | MS_REMOUNT;
     if (mount.type != "proc") {
         // Linux kernel requires MS_REMOUNT | MS_BIND to safely change mount options
         // (e.g., ro/rw) of an existing bind mount without altering the underlying
@@ -842,7 +750,7 @@ public:
         // namespace, instead of being silently ignored.
         unsigned long prop{ 0 };
         if (oci_config.linux_ && oci_config.linux_->rootfs_propagation_) {
-            prop = to_os_rootfs_propagation(*oci_config.linux_->rootfs_propagation_);
+            prop = specconv::to_rootfs_propagation(*oci_config.linux_->rootfs_propagation_);
         } else if (has_mount_ns) {
             // rootfsPropagation is OPTIONAL per spec, Without a private mount
             // namespace there is nothing to apply by default.
@@ -1006,13 +914,13 @@ public:
             config::mount mount{ };
             mount.destination = path;
             mount.source = dst_ref.proc_path();
-            mount.vfs_flags = from_os_vfs_flags(vfs_flags);
+            mount.vfs_flags = specconv::from_vfs_flags(vfs_flags);
             mount.propagation_flags = prop_flag;
 
             LINYAPS_BOX_LOG_DEBUG("make readonly path {} with {}",
                                   path.string(),
-                                  to_os_vfs_flags(mount.vfs_flags)
-                                    | to_os_propagation_flags(mount.propagation_flags));
+                                  specconv::to_vfs_flags(mount.vfs_flags)
+                                    | specconv::to_propagation_flags(mount.propagation_flags));
             auto delay_mount = do_mount(container, root, mount);
             if (!delay_mount) {
                 throw std::runtime_error(
@@ -1814,8 +1722,18 @@ private:
 void set_rlimits(const std::vector<linyaps_box::config::rlimit> &rlimits)
 {
     std::for_each(rlimits.begin(), rlimits.end(), [](const linyaps_box::config::rlimit &rlimit) {
-        const struct ::rlimit rl{ rlimit.soft, rlimit.hard };
-        const auto resource = utils::to_rlimit_resource(rlimit.type_);
+        const auto soft = specconv::to_rlim_t(rlimit.soft);
+        const auto hard = specconv::to_rlim_t(rlimit.hard);
+        if (!soft || !hard) {
+            throw std::runtime_error(
+              fmt::format("rlimit {} (soft={}, hard={}) is not representable on this platform",
+                          rlimit.type_,
+                          rlimit.soft,
+                          rlimit.hard));
+        }
+
+        const struct ::rlimit rl{ *soft, *hard };
+        const auto resource = specconv::to_rlimit_resource(rlimit.type_);
         LINYAPS_BOX_LOG_DEBUG("Set rlimit {}: Soft={}, Hard={}",
                               rlimit.type_,
                               rlimit.soft,
@@ -1843,7 +1761,7 @@ std::pair<int, parent_message_channel> start_container_process(container &contai
         namespaces = oci_config.linux_->namespaces;
     }
 
-    const int clone_flag = static_cast<int>(utils::generate_clone_flags(namespaces));
+    const int clone_flag = static_cast<int>(specconv::generate_clone_flags(namespaces));
     clone_fn_args args = { options.preserve_fds, &container, std::move(child) };
 
     LINYAPS_BOX_LOG_DEBUG("OCI runtime in runtime namespace: PID={} PIDNS={}",
@@ -2309,7 +2227,7 @@ container::container(status_directory status_dir, const create_container_options
                 throw std::runtime_error("destination of mount point is relative");
             }
 
-            if ((to_os_vfs_flags(mount.vfs_flags) & MS_BIND) == 0) {
+            if ((specconv::to_vfs_flags(mount.vfs_flags) & MS_BIND) == 0) {
                 return;
             }
 
